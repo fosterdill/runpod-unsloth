@@ -197,6 +197,68 @@ From then on every pod boot has the repo at `/workspace/runpod-unsloth`.
 Iteration loop while editing in VS Code Remote-SSH writes directly to
 the network volume — no syncing needed.
 
+## llama.cpp on the pod
+
+llama.cpp is built once into `/workspace/opt/llama.cpp` (network volume), so
+the binaries persist across `pod.py down`/`up` cycles. `pod.py`'s bootstrap
+adds them to `$PATH` automatically — every future pod just has `llama-cli`,
+`llama-server`, `llama-quantize` etc. on PATH the moment you `ssh runpod`.
+
+To install (one time per network volume):
+
+```bash
+ssh runpod
+mkdir -p /workspace/opt && cd /workspace/opt
+git clone --depth=1 https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
+# binaries land in /workspace/opt/llama.cpp/build/bin/
+```
+
+Then in a fresh shell `which llama-cli` should resolve. If you've never run
+`pod.py up` since this README change, run it once so the bashrc gets the
+guarded PATH line; otherwise add it manually:
+
+```bash
+echo '[ -d /workspace/opt/llama.cpp/build/bin ] && export PATH=/workspace/opt/llama.cpp/build/bin:$PATH' >> ~/.bashrc
+```
+
+### Quick chat with `llama-chat`
+
+`bin/llama-chat` is a one-line wrapper around `hf download` + `llama-cli`.
+It takes an HF GGUF repo, optionally a quant suffix, downloads to the HF
+cache (which lives on the network volume), and drops you into an
+interactive llama.cpp chat with all layers on the GPU.
+
+```bash
+llama-chat unsloth/Qwen3.5-35B-A3B-GGUF                 # default UD-IQ4_XS
+llama-chat unsloth/Qwen3.5-35B-A3B-GGUF:Q4_K_M
+llama-chat unsloth/Llama-3.2-3B-Instruct-GGUF:Q8_0 -c 16384
+```
+
+Defaults are `-ngl 999 -c 8192 -cnv`; pass any extra `llama-cli` flag after
+the spec and it's exec'd through. The script handles multi-shard GGUFs (it
+hands the first shard to llama-cli, which discovers the rest). `bin/` is on
+`$PATH` automatically via `pod.py`'s bashrc setup.
+
+For sizing — on a 24 GB 4090, `UD-IQ4_XS` is the sane default for ~30B+
+MoE models like Qwen3.5-35B-A3B; `Q4_K_M` is too big to fully offload (see
+the table above the line — 22 GB weights + KV cache exceeds 24 GB VRAM).
+
+If you ever need raw `llama-cli`:
+
+```bash
+llama-cli -m /workspace/.cache/huggingface/hub/models--*/snapshots/*/foo.gguf \
+    -ngl 999 -c 8192 -cnv
+```
+
+To rebuild (e.g. to pick up upstream changes):
+
+```bash
+cd /workspace/opt/llama.cpp && git pull && cmake --build build --config Release -j
+```
+
 ## Costs to watch
 
 * **4090 Secure Cloud:** ~$0.69/hr while running. Stops billing the second
@@ -246,6 +308,20 @@ Always use `use_gradient_checkpointing="unsloth"` — it's free memory.
   by default; this is almost always a stale `WANDB_API_KEY`. Re-run
   `wandb login` inside the pod, or just `./pod.py down` and `./pod.py up`
   again with a fresh `WANDB_API_KEY` in `.env`.
+* **`CUDA error 804: forward compatibility was attempted on non supported HW`**
+  on `import torch` / `import unsloth` — the unsloth image ships
+  `/usr/local/cuda-12.8/compat/libcuda.so` (forward-compat libcuda built for
+  driver 570+), and `ldconfig` puts it ahead of the host's passthrough
+  libcuda. Forward-compat only works on datacenter GPUs (A100/H100), so when
+  RunPod places you on a 4090 host whose driver is < 570 (e.g. 550.x), torch
+  blows up at import. `pod.py`'s bootstrap now writes
+  `export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH` into
+  `~/.bashrc` on every `up`, which makes the dynamic linker prefer the host
+  driver's libcuda instead. On hosts that already have driver ≥ 570 it's a
+  no-op. If you ever see `cudaErrorNotSupported` partway through training,
+  that's the cu128↔550 mismatch leaking — the right fix is then to re-roll
+  (`./pod.py down -y && ./pod.py up`) until you land on a host with
+  `nvidia-smi` reporting driver ≥ 570.
 
 ## Why this layout
 

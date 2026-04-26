@@ -252,7 +252,13 @@ def bootstrap_pod(pod_host_id: str, pubkey: str,
       * /workspace/.ssh/authorized_keys     — your local pubkey appended (idempotent)
       * /workspace/.netrc                   — wandb credentials (if WANDB_API_KEY set)
       * /workspace/.cache/huggingface/token — HF token (if HF_TOKEN set)
-      * /home/unsloth/.bashrc               — `cd /workspace/runpod-unsloth` line
+      * /home/unsloth/.bashrc               — `cd /workspace/runpod-unsloth`,
+                                              an LD_LIBRARY_PATH export that
+                                              avoids the broken CUDA forward-
+                                              compat layer on 4090 hosts, and
+                                              guarded PATH additions for
+                                              llama.cpp under /workspace/opt
+                                              and the repo's own bin/
                                               (re-applied each up since the
                                               container disk is wiped on down)
 
@@ -311,11 +317,36 @@ def bootstrap_pod(pod_host_id: str, pubkey: str,
             "echo HF_OK",
         ]
     lines += [
-        # --- bashrc cd shortcut (idempotent; re-applied each `up`) ---
+        # --- bashrc additions (idempotent; re-applied each `up`) ---
+        # 1. cd into the repo on login.
+        # 2. Force the host's libcuda over the container's CUDA forward-compat
+        #    layer. The unsloth image ships /usr/local/cuda-12.8/compat/libcuda.so
+        #    (forward-compat for driver 570+) which ldconfig prefers over the
+        #    host's passthrough libcuda. Forward-compat is unsupported on
+        #    consumer GPUs (RTX 4090 et al.), so when RunPod places us on a
+        #    host with driver < 570, torch fails at import with CUDA error 804
+        #    ("forward compatibility was attempted on non supported HW").
+        #    Putting /usr/lib/x86_64-linux-gnu first on LD_LIBRARY_PATH makes
+        #    the dynamic linker pick the host's real libcuda. On hosts that
+        #    already have driver >= 570 this is a no-op (both libs work).
+        #    See README "Troubleshooting → CUDA error 804".
+        # 3. Put llama.cpp's binaries on PATH if they exist on the volume.
+        #    Built once into /workspace/opt/llama.cpp/build/bin (see README
+        #    "llama.cpp on the pod"); the test guard means the line is harmless
+        #    on volumes where it isn't installed.
         "BRC=/home/unsloth/.bashrc",
-        "CD='cd /workspace/runpod-unsloth 2>/dev/null'",
         "touch \"$BRC\"",
+        "CD='cd /workspace/runpod-unsloth 2>/dev/null'",
         "grep -qxF \"$CD\" \"$BRC\" || echo \"$CD\" >> \"$BRC\"",
+        "LDP='export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH'",
+        "grep -qxF \"$LDP\" \"$BRC\" || echo \"$LDP\" >> \"$BRC\"",
+        "LCP='[ -d /workspace/opt/llama.cpp/build/bin ] "
+        "&& export PATH=/workspace/opt/llama.cpp/build/bin:$PATH'",
+        "grep -qxF \"$LCP\" \"$BRC\" || echo \"$LCP\" >> \"$BRC\"",
+        # 4. Repo's own bin/ on PATH (llama-chat, etc).
+        "RBP='[ -d /workspace/runpod-unsloth/bin ] "
+        "&& export PATH=/workspace/runpod-unsloth/bin:$PATH'",
+        "grep -qxF \"$RBP\" \"$BRC\" || echo \"$RBP\" >> \"$BRC\"",
         "echo BASHRC_OK",
     ]
     lines += ["echo BOOTSTRAP_OK", "exit"]
