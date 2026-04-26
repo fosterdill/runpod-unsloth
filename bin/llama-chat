@@ -26,8 +26,8 @@ if [ $# -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     exit 0
 fi
 
-if ! command -v hf >/dev/null 2>&1; then
-    echo "llama-chat: \`hf\` CLI not found. Install with: pip install -U huggingface_hub" >&2
+if ! python3 -c "import huggingface_hub" 2>/dev/null; then
+    echo "llama-chat: \`huggingface_hub\` not installed. Install with: pip install -U huggingface_hub" >&2
     exit 1
 fi
 if ! command -v llama-cli >/dev/null 2>&1; then
@@ -51,9 +51,14 @@ fi
 echo "[llama-chat] repo=${repo} quant=${quant}"
 echo "[llama-chat] downloading anything matching *${quant}* (cached, so re-runs are instant)..."
 
-# `hf download <repo> --include <pattern>` (no --local-dir) lands the files
-# in the standard hub cache and prints the snapshot directory path.
-snapshot=$(hf download "$repo" --include "*${quant}*")
+# Use the Python API directly: the `hf` CLI now decorates stdout with ANSI
+# color codes and a "✓ Downloaded\n  path: ..." banner, which is fragile to
+# parse. snapshot_download() returns the cache snapshot dir as a plain string.
+snapshot=$(HF_REPO="$repo" HF_PATTERN="*${quant}*" python3 -c '
+import os
+from huggingface_hub import snapshot_download
+print(snapshot_download(os.environ["HF_REPO"], allow_patterns=[os.environ["HF_PATTERN"]]))
+')
 
 # Pick the entrypoint file. For multi-shard GGUFs llama.cpp wants the first
 # shard ("...-00001-of-NNNNN.gguf"); single-file GGUFs just match the glob.
