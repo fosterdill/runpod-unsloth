@@ -11,7 +11,9 @@ Usage:
   ./pod.py jupyter [POD_ID]    # open Jupyter Lab in your browser
   ./pod.py logs  [POD_ID]      # print pod logs (best-effort via runpodctl)
   ./pod.py stop  [POD_ID]      # halt pod (resumable, container disk billed)
+  ./pod.py resume [POD_ID]     # resume a stopped pod and refresh SSH alias
   ./pod.py down  [POD_ID]      # terminate pod (cheapest; volume data persists)
+  ./pod.py push  PATH...       # rsync/scp files to /workspace/data/ on the pod
   ./pod.py gpus                # list GPU type ids RunPod is currently exposing
   ./pod.py volumes             # show your network volumes (datacenter ids)
   ./pod.py info  [POD_ID]      # full pod metadata as JSON
@@ -29,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -594,6 +597,58 @@ def cmd_stop(args, cfg):
     print(json.dumps(runpod.stop_pod(pod_id), indent=2))
 
 
+def cmd_resume(args, cfg):
+    pod_id = resolve_pod_id(args.pod_id)
+    gpu_count = cfg["gpu"]["count"]
+    print(f"[resume] {pod_id} (gpu_count={gpu_count})")
+    print(json.dumps(runpod.resume_pod(pod_id, gpu_count), indent=2))
+    print(f"[resume] polling for SSH (up to {args.timeout}s)...")
+    if not connect_and_persist(pod_id, timeout=args.timeout):
+        die(f"pod {pod_id} not RUNNING after {args.timeout}s. "
+            f"Try `./pod.py wait` or check `./pod.py status`.")
+    print_connect_help(pod_id)
+
+
+def cmd_push(args, cfg):
+    """Copy local files/dirs to the pod via the `runpod` SSH alias.
+
+    Lands under /workspace (the network volume), so files persist across
+    pods. Uses rsync if available (resumable + progress), else falls back
+    to scp. Refreshes the SSH alias first in case IP/port changed.
+    """
+    paths = [Path(p).expanduser() for p in args.paths]
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        die("not found: " + ", ".join(missing))
+
+    pod_id = resolve_pod_id(args.pod_id)
+    if not connect_and_persist(pod_id, timeout=args.timeout):
+        die(f"pod {pod_id} not RUNNING after {args.timeout}s. "
+            f"Try `./pod.py wait` or check `./pod.py status`.")
+
+    dest = args.dest if args.dest.endswith("/") else args.dest + "/"
+    mk = subprocess.run(
+        ["ssh", SSH_HOST_ALIAS, f"mkdir -p {shlex.quote(dest)}"],
+        check=False,
+    )
+    if mk.returncode != 0:
+        die(f"failed to create remote dir {dest} (ssh exit {mk.returncode})")
+
+    srcs = [str(p) for p in paths]
+    if shutil.which("rsync"):
+        cmd = ["rsync", "-avh", "--progress", "--partial", *srcs,
+               f"{SSH_HOST_ALIAS}:{dest}"]
+    else:
+        cmd = ["scp", "-r", *srcs, f"{SSH_HOST_ALIAS}:{dest}"]
+    print("$", " ".join(cmd))
+    r = subprocess.run(cmd, check=False)
+    if r.returncode != 0:
+        die(f"copy failed (exit {r.returncode})")
+    print(f"[push] copied {len(paths)} item(s) to {SSH_HOST_ALIAS}:{dest}")
+    for p in paths:
+        print(f"  {dest}{p.name}")
+
+
 def cmd_down(args, cfg):
     pod_id = resolve_pod_id(args.pod_id)
     if not args.yes:
@@ -673,6 +728,22 @@ def main():
     sp = sub.add_parser("stop", help="halt pod (resumable; container disk still billed)")
     sp.add_argument("pod_id", nargs="?")
     sp.set_defaults(func=cmd_stop)
+
+    sp = sub.add_parser("resume", help="resume a stopped pod and refresh SSH alias")
+    sp.add_argument("pod_id", nargs="?")
+    sp.add_argument("--timeout", type=int, default=600,
+                    help="seconds to wait for SSH after resume (default 600)")
+    sp.set_defaults(func=cmd_resume)
+
+    sp = sub.add_parser("push", help="copy local files to /workspace/data/ on the pod")
+    sp.add_argument("paths", nargs="+", help="local files or directories to copy")
+    sp.add_argument("--dest", default="/workspace/data/",
+                    help="remote directory (default /workspace/data/)")
+    sp.add_argument("--pod-id", dest="pod_id",
+                    help="target pod (default: last created)")
+    sp.add_argument("--timeout", type=int, default=120,
+                    help="seconds to wait for SSH (default 120)")
+    sp.set_defaults(func=cmd_push)
 
     sp = sub.add_parser("down", help="terminate pod (cheapest; network volume persists)")
     sp.add_argument("pod_id", nargs="?")
