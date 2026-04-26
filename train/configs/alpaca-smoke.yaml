@@ -9,8 +9,11 @@ data:
   name: yahma/alpaca-cleaned
   split: "train[:2000]"
   format: alpaca
+  eval_fraction: 0.05         # carve 5% (~100 rows) off train as held-out eval
 
 # Defaults for everything else are fine for a smoke test.
 # See train/configs/README.md for the full schema.
 max_steps: 60
 save_steps: 30
+eval:
+  steps: 30                   # evaluate twice over the run (at step 30 and 60)

@@ -32,6 +32,11 @@ data:
   format: alpaca                          # "alpaca" | "chat" | "raw"
   # text_field: text                      # if format=raw and column != "text"
 
+  # Optional held-out eval set — pick at most one:
+  # eval_split: "test"                    # source=hf: a separate HF split
+  # eval_path: /workspace/datasets/eval.jsonl  # source=jsonl: a separate file
+  # eval_fraction: 0.05                   # either source: random holdout from train
+
 # Optional — defaults shown
 max_seq_length: 2048
 
@@ -58,10 +63,24 @@ save_steps: 60
 save_total_limit: 2
 seed: 3407
 
+# Eval (only runs if data has eval_split / eval_path / eval_fraction set)
+eval:
+  steps: 60                               # evaluate every N training steps; defaults to save_steps
+  batch_size: 2                           # per_device_eval_batch_size; defaults to batch_size
+
 # Output
 output_dir: /workspace/runs               # full path = output_dir/name
 wandb_project: runpod-unsloth
 ```
+
+## Validation / eval set
+
+Set one of `data.eval_split`, `data.eval_path`, or `data.eval_fraction` to enable
+a held-out eval loop. The trainer will log `eval_loss` to wandb every
+`eval.steps` training steps.
+
+Each evaluation runs `ceil(len(eval_ds) / eval.batch_size)` forward passes over
+the eval set. Total evals over a run ≈ `max_steps / eval.steps`.
 
 ## Data formats
 
