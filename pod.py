@@ -191,24 +191,32 @@ def find_identity_file() -> str:
     return "~/.ssh/id_ed25519"  # default; SSH will fall back to agent if absent
 
 
-def write_ssh_alias(pod_host_id: str):
-    """Insert/replace a Host runpod block using RunPod's proxy SSH endpoint.
+# SSH login user inside the pod. The unsloth/unsloth image runs as a
+# non-root user `unsloth` (uid 1001) whose home directory is /workspace —
+# the network volume. This is exactly what we want: dropping our public
+# key into /workspace/.ssh/authorized_keys means the key persists across
+# every pod that mounts this volume.
+POD_SSH_USER = "unsloth"
+POD_AUTHORIZED_KEYS = "/workspace/.ssh/authorized_keys"
 
-    `pod_host_id` is the value of `machine.podHostId` from the GraphQL API
-    (e.g. `giw8xruy2o54dw-64411de3`). It IS the SSH username — no derivation.
 
-    Proxy SSH (`ssh.runpod.io`) uses your account-level public key, doesn't
-    require port 22 to be exposed publicly, and works on any image. Much more
-    reliable than direct port-22 SSH which depends on the image's sshd config.
+def write_ssh_alias(ip: str, port: int):
+    """Insert/replace a Host runpod block using DIRECT SSH (unsloth@ip:port).
+
+    Direct SSH supports PTY (so VS Code Remote-SSH works), unlike RunPod's
+    proxy SSH which doesn't. To make this work the pod's authorized_keys
+    has to contain your public key — that's what bootstrap_authorized_keys()
+    does, using the proxy SSH path (which lands as the same `unsloth` user)
+    as the channel.
     """
     SSH_CONFIG.parent.mkdir(mode=0o700, exist_ok=True)
-    user = pod_host_id
     identity = find_identity_file()
     block = (
         f"{SSH_BLOCK_BEGIN}\n"
         f"Host {SSH_HOST_ALIAS}\n"
-        f"  HostName ssh.runpod.io\n"
-        f"  User {user}\n"
+        f"  HostName {ip}\n"
+        f"  Port {port}\n"
+        f"  User {POD_SSH_USER}\n"
         f"  IdentityFile {identity}\n"
         f"  IdentitiesOnly yes\n"
         f"  StrictHostKeyChecking no\n"
@@ -223,7 +231,76 @@ def write_ssh_alias(pod_host_id: str):
     SSH_CONFIG.write_text(new)
     SSH_CONFIG.chmod(0o600)
     print(f"[ssh-config] {SSH_CONFIG}: alias `{SSH_HOST_ALIAS}` -> "
-          f"{user}@ssh.runpod.io  (identity: {identity})")
+          f"{POD_SSH_USER}@{ip}:{port}  (identity: {identity})")
+
+
+def bootstrap_authorized_keys(pod_host_id: str, pubkey: str) -> tuple[bool, str]:
+    """Append `pubkey` to /workspace/.ssh/authorized_keys via proxy SSH.
+
+    Why /workspace and not /root: the unsloth/unsloth image runs as user
+    `unsloth` (uid 1001) with home dir /workspace. Proxy SSH lands you as
+    that same user. So we can write into /workspace/.ssh/authorized_keys
+    (which we have permission for) and direct SSH as user `unsloth` on the
+    pod's exposed port 22 will accept the key.
+
+    BIG bonus: /workspace is the network volume, so once the key is there,
+    every future pod that mounts this volume sees it immediately — the
+    bootstrap is essentially a no-op forever after the first time.
+
+    Implementation notes:
+      * `-tt` forces client-side PTY allocation. RunPod's proxy SSH refuses
+        sessions where the client won't accept a PTY ("Your SSH client
+        doesn't support PTY").
+      * We don't pass a remote command — the proxy ignores command args and
+        only gives you an interactive shell. So we drive that shell over
+        stdin (script + `exit`), and base64-embed the pubkey to avoid any
+        PTY input quoting weirdness.
+
+    Returns (success, message). Idempotent — appends only if not present.
+    """
+    import base64
+    if not pubkey:
+        return False, "no local public key found (~/.ssh/id_ed25519.pub or id_rsa.pub)"
+    identity = os.path.expanduser(find_identity_file())
+    encoded = base64.b64encode(pubkey.encode()).decode()
+    ak = POD_AUTHORIZED_KEYS
+
+    script = (
+        "set -e\n"
+        f"mkdir -p $(dirname {ak}) && chmod 700 $(dirname {ak})\n"
+        f"touch {ak}\n"
+        f"K=$(echo {encoded} | base64 -d)\n"
+        f"grep -qxF \"$K\" {ak} || echo \"$K\" >> {ak}\n"
+        f"chmod 600 {ak}\n"
+        "echo BOOTSTRAP_OK\n"
+        "exit\n"
+    )
+    cmd = [
+        "ssh",
+        "-tt",                                  # force PTY (proxy requires it)
+        "-i", identity,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", "ConnectTimeout=15",
+        f"{pod_host_id}@ssh.runpod.io",
+        # NB: no command argument; we drive the interactive shell via stdin.
+    ]
+    try:
+        r = subprocess.run(cmd, input=script,
+                           capture_output=True, text=True, timeout=45)
+    except FileNotFoundError:
+        return False, "`ssh` not on PATH"
+    except subprocess.TimeoutExpired:
+        return False, ("proxy SSH bootstrap timed out (45s) — "
+                       "use the RunPod web terminal to inspect")
+    out = r.stdout + r.stderr
+    if "BOOTSTRAP_OK" in out:
+        return True, "key installed"
+    # Strip ANSI/control-char noise PTY introduces, then surface what we got.
+    import re
+    cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\r", "", out).strip()
+    return False, cleaned[-300:] if cleaned else f"ssh exit {r.returncode}"
 
 
 def remove_ssh_alias():
@@ -311,10 +388,10 @@ def cmd_up(args, cfg):
 
 
 def wait_for_ssh(pod_id: str, timeout: int = 600, quiet: bool = False):
-    """Poll until pod is RUNNING and machine.podHostId is populated.
+    """Poll until pod is RUNNING, podHostId is set, and port 22 is exposed.
 
-    Returns the podHostId string (e.g. "giw8xruy2o54dw-64411de3") on success,
-    None on timeout. Prints state transitions while waiting.
+    Returns dict {pod_host_id, ip, port} on success, None on timeout.
+    Prints state transitions while waiting.
     """
     deadline = time.time() + timeout
     last_state = None
@@ -331,29 +408,67 @@ def wait_for_ssh(pod_id: str, timeout: int = 600, quiet: bool = False):
         machine = info.get("machine") or {}
         host_id = machine.get("podHostId") or ""
         runtime = info.get("runtime") or {}
+
+        # Look for the public port-22 mapping (needed for direct SSH / VS Code).
+        ssh_port = None
+        ssh_ip = None
+        for p in runtime.get("ports") or []:
+            if p.get("privatePort") == 22 and p.get("isIpPublic"):
+                ssh_ip = p["ip"]; ssh_port = p["publicPort"]; break
+
         if not quiet and state != last_state:
             elapsed = int(time.time() - started)
             print(f"[wait] +{elapsed:>3}s  state={state}  "
                   f"uptime={runtime.get('uptimeInSeconds', 0)}s  "
-                  f"podHostId={'(pending)' if not host_id else host_id}")
+                  f"podHostId={host_id or '(pending)'}  "
+                  f"ssh22={'(pending)' if not ssh_port else f'{ssh_ip}:{ssh_port}'}")
             last_state = state
-        if state == "RUNNING" and host_id:
-            return host_id
+        if state == "RUNNING" and host_id and ssh_port:
+            return {"pod_host_id": host_id, "ip": ssh_ip, "port": ssh_port}
         time.sleep(5)
     return None
 
 
 def connect_and_persist(pod_id: str, timeout: int = 600):
-    """Wait for RUNNING + write SSH alias. Returns podHostId or None."""
-    host_id = wait_for_ssh(pod_id, timeout=timeout)
-    if host_id:
-        write_ssh_alias(host_id)
-    return host_id
+    """Wait for ready, bootstrap authorized_keys, write direct-SSH alias.
+
+    Two-step because:
+      1. RunPod's proxy SSH (ssh.runpod.io) authenticates with our account
+         key but doesn't support PTY → bad for VS Code Remote-SSH.
+      2. Direct SSH (root@ip:port) supports PTY → good for VS Code, but the
+         pod's authorized_keys must contain our pubkey for it to authenticate.
+    So: use proxy SSH to install our pubkey into authorized_keys (bootstrap),
+    then point the alias at direct SSH for everything else.
+
+    Returns the endpoint dict on success, None on timeout.
+    """
+    target = wait_for_ssh(pod_id, timeout=timeout)
+    if not target:
+        return None
+
+    pubkey = find_public_key()
+    if not pubkey:
+        print("[bootstrap] no local public key (~/.ssh/id_ed25519.pub or id_rsa.pub); "
+              "skipping authorized_keys install. `ssh runpod` will fail until you "
+              "add a key. Generate one with: ssh-keygen -t ed25519", file=sys.stderr)
+    else:
+        ok, msg = bootstrap_authorized_keys(target["pod_host_id"], pubkey)
+        if ok:
+            print(f"[bootstrap] {msg}: ensured pubkey is in {POD_AUTHORIZED_KEYS} "
+                  f"(persists on the network volume)")
+        else:
+            print(f"[bootstrap] WARN: {msg}", file=sys.stderr)
+            print(f"[bootstrap] direct SSH will fail. As a workaround, ssh into the "
+                  f"pod via proxy ({target['pod_host_id']}@ssh.runpod.io) and append "
+                  f"your pubkey to {POD_AUTHORIZED_KEYS} manually.", file=sys.stderr)
+
+    write_ssh_alias(target["ip"], target["port"])
+    return target
 
 
 def print_connect_help(pod_id: str):
     print()
-    print("  ssh runpod                   # uses ~/.ssh/config alias (proxy SSH)")
+    print("  ssh runpod                   # direct SSH via ~/.ssh/config alias")
     print("  ./pod.py code                # open VS Code Remote-SSH on /workspace")
     print(f"  ./pod.py jupyter             # https://{pod_id}-8888.proxy.runpod.net")
 
