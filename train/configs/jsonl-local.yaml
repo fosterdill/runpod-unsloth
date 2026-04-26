@@ -1,0 +1,18 @@
+# Example: fine-tune on your own JSONL file living on the network volume.
+#
+# Expected JSONL row shape depends on `format`:
+#   format: alpaca   -> {"instruction": "...", "input": "...", "output": "..."}
+#   format: chat     -> {"messages": [{"role": "user", "content": "..."},
+#                                     {"role": "assistant", "content": "..."}]}
+#   format: raw      -> {"text": "...full pre-formatted training example..."}
+
+name: my-custom-dataset
+model: unsloth/Meta-Llama-3.1-8B-bnb-4bit
+
+data:
+  source: jsonl
+  path: /workspace/datasets/my-data.jsonl
+  format: alpaca
+
+max_steps: 1000
+save_steps: 200

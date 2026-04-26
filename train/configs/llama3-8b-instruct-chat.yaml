@@ -1,0 +1,26 @@
+# Example: fine-tune Llama-3.1-8B-Instruct on chat-formatted data.
+# Use `--format chat` when chatting with the resulting adapter.
+
+name: llama3-8b-instruct-chat
+model: unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit
+max_seq_length: 4096
+
+data:
+  source: hf
+  name: HuggingFaceH4/ultrachat_200k
+  split: "train_sft[:5000]"
+  format: chat                      # uses tokenizer.apply_chat_template
+
+lora:
+  r: 32                             # bigger rank for chat-style fine-tuning
+  alpha: 32
+  dropout: 0.05
+
+# Training: ~3000 steps for a non-trivial run on 5k examples.
+max_steps: 3000
+batch_size: 1                       # 4096-seq at r=32 is tight on a 4090
+grad_accum: 8
+learning_rate: 1.0e-4
+warmup_steps: 50
+save_steps: 500
+save_total_limit: 3

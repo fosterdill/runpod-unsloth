@@ -1,0 +1,16 @@
+# Smoke test: 60 steps of Llama-3.1-8B QLoRA on a slice of Alpaca.
+# Mirrors the original example_qlora.py. ~5 min on a 4090.
+
+name: alpaca-smoke
+model: unsloth/Meta-Llama-3.1-8B-bnb-4bit
+
+data:
+  source: hf
+  name: yahma/alpaca-cleaned
+  split: "train[:2000]"
+  format: alpaca
+
+# Defaults for everything else are fine for a smoke test.
+# See train/configs/README.md for the full schema.
+max_steps: 60
+save_steps: 30

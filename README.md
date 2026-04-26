@@ -6,14 +6,69 @@ and datasets stay alive between sessions.
 
 ```
 runpod-unsloth/
-├── Dockerfile           # FROM unsloth/unsloth + wandb + entrypoint
-├── entrypoint.sh        # wires WANDB_API_KEY, starts sshd + jupyter
-├── pod.py               # CLI: up / down / ssh / status / volumes / gpus
+├── Dockerfile           # FROM unsloth/unsloth + wandb + entrypoint (optional)
+├── entrypoint.sh        # only used if you build the custom image
+├── pod.py               # local CLI: up / down / ssh / code / status / volumes / gpus
 ├── config.toml          # GPU, image, volume, ports — edit once
 ├── .env.example         # secrets (RunPod + wandb + HF tokens)
 ├── requirements.txt     # for pod.py (runpod, python-dotenv, tomli)
-└── train/
-    └── example_qlora.py # 8B QLoRA reference run sized for 4090 24GB
+└── train/               # runs ON the pod
+    ├── train.py            # generic trainer, takes a YAML config
+    ├── chat.py             # interactive chat REPL for any adapter
+    ├── export_gguf.py      # merge LoRA + quantize → llama.cpp-ready file
+    └── configs/
+        ├── alpaca-smoke.yaml             # 60-step smoke test on Alpaca
+        ├── llama3-8b-instruct-chat.yaml  # multi-turn chat on Ultrachat
+        ├── jsonl-local.yaml              # train on your own JSONL
+        └── README.md                     # full config schema
+```
+
+## Training a new model
+
+The whole point of the `train/` setup: each fine-tune is one YAML config file.
+
+```bash
+# On the pod (after ./pod.py code or ssh runpod)
+cd /workspace/runpod-unsloth
+
+# Run any config:
+python train/train.py train/configs/alpaca-smoke.yaml
+
+# Or override fields from the CLI without editing the file:
+python train/train.py train/configs/alpaca-smoke.yaml \
+    --name alpaca-1k --max-steps 1000 --lr 1e-4
+```
+
+Add a new training run by dropping a new `.yaml` in `train/configs/`. See
+`train/configs/README.md` for the full field list — only `name`, `model`,
+`data.source`, and `data.format` are required.
+
+## Chatting with a trained adapter
+
+```bash
+# Single-turn (Alpaca-trained adapters)
+python train/chat.py /workspace/runs/alpaca-smoke/adapter
+
+# Multi-turn (chat-trained adapters or *-Instruct base models)
+python train/chat.py /workspace/runs/my-chat-run/adapter --format chat \
+    --system "You are a terse senior engineer."
+```
+
+Slash commands work mid-conversation: `/reset`, `/system <text>`, `/temp 0.3`,
+`/save chat.log`, `/exit`. Up-arrow recalls previous prompts.
+
+## Exporting for laptop inference (llama.cpp)
+
+```bash
+# On the pod
+python train/export_gguf.py /workspace/runs/alpaca-smoke/adapter         # default q4_k_m
+python train/export_gguf.py /workspace/runs/alpaca-smoke/adapter q5_k_m  # better quality
+
+# On your laptop
+scp 'runpod:/workspace/runs/alpaca-smoke/gguf/*.gguf' ~/models/
+brew install llama.cpp
+llama-server -m ~/models/unsloth.Q4_K_M.gguf -c 4096
+# open http://localhost:8080
 ```
 
 ## One-time setup
