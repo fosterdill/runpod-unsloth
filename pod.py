@@ -152,15 +152,65 @@ def _strip_block(text: str) -> str:
     return out.strip() + "\n"
 
 
-def write_ssh_alias(ip: str, port: int):
-    """Insert/replace a Host runpod block pointing at ip:port."""
+def get_pod_full(pod_id: str) -> dict:
+    """Fetch the pod with the extra fields the stock SDK query omits.
+
+    Specifically we need `machine.podHostId`, which is the username RunPod's
+    proxy SSH (ssh.runpod.io) expects (e.g. `giw8xruy2o54dw-64411de3`).
+    """
+    import requests
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {runpod.api_key}"}
+    query = """
+    query getPod($podId: String!) {
+      pod(input: {podId: $podId}) {
+        id name desiredStatus machineId
+        runtime { uptimeInSeconds ports { ip privatePort publicPort isIpPublic type } }
+        machine { gpuDisplayName podHostId secureCloud dataCenterId }
+      }
+    }"""
+    r = requests.post(
+        "https://api.runpod.io/graphql",
+        json={"query": query, "variables": {"podId": pod_id}},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(f"graphql error: {body['errors']}")
+    return body.get("data", {}).get("pod") or {}
+
+
+def find_identity_file() -> str:
+    """Return the path to the user's preferred SSH private key for the alias."""
+    for fname in ("id_ed25519", "id_rsa"):
+        p = Path.home() / ".ssh" / fname
+        if p.exists():
+            return str(p).replace(str(Path.home()), "~", 1)
+    return "~/.ssh/id_ed25519"  # default; SSH will fall back to agent if absent
+
+
+def write_ssh_alias(pod_host_id: str):
+    """Insert/replace a Host runpod block using RunPod's proxy SSH endpoint.
+
+    `pod_host_id` is the value of `machine.podHostId` from the GraphQL API
+    (e.g. `giw8xruy2o54dw-64411de3`). It IS the SSH username — no derivation.
+
+    Proxy SSH (`ssh.runpod.io`) uses your account-level public key, doesn't
+    require port 22 to be exposed publicly, and works on any image. Much more
+    reliable than direct port-22 SSH which depends on the image's sshd config.
+    """
     SSH_CONFIG.parent.mkdir(mode=0o700, exist_ok=True)
+    user = pod_host_id
+    identity = find_identity_file()
     block = (
         f"{SSH_BLOCK_BEGIN}\n"
         f"Host {SSH_HOST_ALIAS}\n"
-        f"  HostName {ip}\n"
-        f"  Port {port}\n"
-        f"  User root\n"
+        f"  HostName ssh.runpod.io\n"
+        f"  User {user}\n"
+        f"  IdentityFile {identity}\n"
+        f"  IdentitiesOnly yes\n"
         f"  StrictHostKeyChecking no\n"
         f"  UserKnownHostsFile /dev/null\n"
         f"  LogLevel ERROR\n"
@@ -172,7 +222,8 @@ def write_ssh_alias(ip: str, port: int):
     new = (cur.rstrip() + "\n\n" + block) if cur.strip() else block
     SSH_CONFIG.write_text(new)
     SSH_CONFIG.chmod(0o600)
-    print(f"[ssh-config] {SSH_CONFIG}: alias `{SSH_HOST_ALIAS}` -> {ip}:{port}")
+    print(f"[ssh-config] {SSH_CONFIG}: alias `{SSH_HOST_ALIAS}` -> "
+          f"{user}@ssh.runpod.io  (identity: {identity})")
 
 
 def remove_ssh_alias():
@@ -245,33 +296,66 @@ def cmd_up(args, cfg):
 
     pod_id = pod["id"]
     remember(pod_id)
-    print(f"[up] pod {pod_id} created. waiting for it to become RUNNING...")
+    print(f"[up] pod {pod_id} created. polling for SSH (up to {args.timeout}s)...")
 
-    # Poll until the pod has a public ssh port mapped.
-    ssh_target = wait_for_ssh(pod_id, timeout=300)
-    if ssh_target:
-        ip, port = ssh_target
-        write_ssh_alias(ip, port)
-        print()
-        print("  ssh runpod                   # short form (uses ~/.ssh/config alias)")
-        print(f"  ssh -p {port} root@{ip}    # raw form")
-        print("  ./pod.py code                # open VS Code Remote-SSH on /workspace")
-        print(f"  ./pod.py jupyter             # https://{pod_id}-8888.proxy.runpod.net")
+    if connect_and_persist(pod_id, timeout=args.timeout):
+        print_connect_help(pod_id)
     else:
-        print("[up] pod is up but SSH port not exposed yet; run `pod.py ssh` in a moment.")
+        print()
+        print(f"[up] pod {pod_id} not RUNNING within {args.timeout}s. The pod may")
+        print("     still be pulling its image — large images take 5-10 min on first boot.")
+        print()
+        print("  ./pod.py wait                # keep polling and write the alias when ready")
+        print("  ./pod.py status              # see if the pod is RUNNING")
+        print("  ./pod.py logs                # peek at boot logs")
 
 
-def wait_for_ssh(pod_id: str, timeout: int = 300):
+def wait_for_ssh(pod_id: str, timeout: int = 600, quiet: bool = False):
+    """Poll until pod is RUNNING and machine.podHostId is populated.
+
+    Returns the podHostId string (e.g. "giw8xruy2o54dw-64411de3") on success,
+    None on timeout. Prints state transitions while waiting.
+    """
     deadline = time.time() + timeout
+    last_state = None
+    started = time.time()
     while time.time() < deadline:
-        info = runpod.get_pod(pod_id)
-        runtime = (info or {}).get("runtime") or {}
-        ports = runtime.get("ports") or []
-        for p in ports:
-            if p.get("privatePort") == 22 and p.get("isIpPublic"):
-                return p["ip"], p["publicPort"]
+        try:
+            info = get_pod_full(pod_id)
+        except Exception as e:
+            if not quiet:
+                print(f"[wait] transient API error: {e}; retrying", file=sys.stderr)
+            time.sleep(5)
+            continue
+        state = info.get("desiredStatus") or "?"
+        machine = info.get("machine") or {}
+        host_id = machine.get("podHostId") or ""
+        runtime = info.get("runtime") or {}
+        if not quiet and state != last_state:
+            elapsed = int(time.time() - started)
+            print(f"[wait] +{elapsed:>3}s  state={state}  "
+                  f"uptime={runtime.get('uptimeInSeconds', 0)}s  "
+                  f"podHostId={'(pending)' if not host_id else host_id}")
+            last_state = state
+        if state == "RUNNING" and host_id:
+            return host_id
         time.sleep(5)
     return None
+
+
+def connect_and_persist(pod_id: str, timeout: int = 600):
+    """Wait for RUNNING + write SSH alias. Returns podHostId or None."""
+    host_id = wait_for_ssh(pod_id, timeout=timeout)
+    if host_id:
+        write_ssh_alias(host_id)
+    return host_id
+
+
+def print_connect_help(pod_id: str):
+    print()
+    print("  ssh runpod                   # uses ~/.ssh/config alias (proxy SSH)")
+    print("  ./pod.py code                # open VS Code Remote-SSH on /workspace")
+    print(f"  ./pod.py jupyter             # https://{pod_id}-8888.proxy.runpod.net")
 
 
 def cmd_status(args, cfg):
@@ -295,11 +379,10 @@ def cmd_status(args, cfg):
 
 def cmd_ssh(args, cfg):
     pod_id = resolve_pod_id(args.pod_id)
-    target = wait_for_ssh(pod_id, timeout=60)
-    if not target:
-        die(f"pod {pod_id} has no public SSH port yet (still booting?)")
-    ip, port = target
-    cmd = ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no", f"root@{ip}"]
+    if not connect_and_persist(pod_id, timeout=args.timeout):
+        die(f"pod {pod_id} not RUNNING after {args.timeout}s. "
+            f"Try `./pod.py wait` or check `./pod.py status`.")
+    cmd = ["ssh", SSH_HOST_ALIAS]
     print("$", " ".join(cmd))
     os.execvp("ssh", cmd)
 
@@ -307,11 +390,9 @@ def cmd_ssh(args, cfg):
 def cmd_code(args, cfg):
     """Open VS Code Remote-SSH into /workspace/runpod-unsloth on the pod."""
     pod_id = resolve_pod_id(args.pod_id)
-    target = wait_for_ssh(pod_id, timeout=60)
-    if not target:
-        die(f"pod {pod_id} has no public SSH port yet (still booting?)")
-    ip, port = target
-    write_ssh_alias(ip, port)  # refresh in case it drifted
+    if not connect_and_persist(pod_id, timeout=args.timeout):
+        die(f"pod {pod_id} not RUNNING after {args.timeout}s. "
+            f"Try `./pod.py wait` first.")
     if not shutil.which("code"):
         die("`code` CLI not on PATH. In VS Code: Cmd+Shift+P -> "
             "'Shell Command: Install code command in PATH'.")
@@ -329,6 +410,20 @@ def cmd_jupyter(args, cfg):
     print(f"[jupyter] {url}")
     if not args.print_only:
         webbrowser.open(url)
+
+
+def cmd_wait(args, cfg):
+    """Poll an existing pod until it's RUNNING, then write the SSH alias.
+
+    Useful when `up` timed out but the pod is still booting (e.g. pulling a
+    large image). Idempotent — safe to run multiple times.
+    """
+    pod_id = resolve_pod_id(args.pod_id)
+    print(f"[wait] polling pod {pod_id} for up to {args.timeout}s")
+    if not connect_and_persist(pod_id, timeout=args.timeout):
+        die(f"pod {pod_id} still not RUNNING after {args.timeout}s. "
+            f"Check ./pod.py status — it may have failed to start.")
+    print_connect_help(pod_id)
 
 
 def cmd_logs(args, cfg):
@@ -392,18 +487,27 @@ def main():
     sp = sub.add_parser("up", help="spin up a pod")
     sp.add_argument("--gpu", help="override config.toml [gpu].type_id")
     sp.add_argument("--image", help="override config.toml [image].name")
+    sp.add_argument("--timeout", type=int, default=600,
+                    help="seconds to wait for SSH after creating pod (default 600)")
     sp.set_defaults(func=cmd_up)
 
     sp = sub.add_parser("status", help="list active pods")
     sp.set_defaults(func=cmd_status)
 
+    sp = sub.add_parser("wait", help="poll for SSH on an existing pod and write alias")
+    sp.add_argument("pod_id", nargs="?")
+    sp.add_argument("--timeout", type=int, default=900, help="seconds to wait (default 900)")
+    sp.set_defaults(func=cmd_wait)
+
     sp = sub.add_parser("ssh", help="ssh into a pod (default: last created)")
     sp.add_argument("pod_id", nargs="?")
+    sp.add_argument("--timeout", type=int, default=120, help="seconds to wait for SSH (default 120)")
     sp.set_defaults(func=cmd_ssh)
 
     sp = sub.add_parser("code", help="open VS Code Remote-SSH on /workspace/runpod-unsloth")
     sp.add_argument("pod_id", nargs="?")
     sp.add_argument("--folder", help="path on the pod to open (default /workspace/runpod-unsloth)")
+    sp.add_argument("--timeout", type=int, default=120, help="seconds to wait for SSH (default 120)")
     sp.set_defaults(func=cmd_code)
 
     sp = sub.add_parser("jupyter", help="open RunPod-proxied Jupyter URL in browser")
