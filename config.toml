@@ -1,0 +1,50 @@
+# pod.py reads this. Edit to taste, then commit.
+# Anything you don't want in source control (API keys) belongs in .env instead.
+
+[image]
+# Set to your pushed image, e.g. "fosterdill/runpod-unsloth:latest".
+# Use "unsloth/unsloth:latest" to skip the Dockerfile step (you lose the
+# baked-in env var defaults but everything else still works — pod.py will
+# pass the env vars at create-pod time).
+name = "unsloth/unsloth:latest"
+
+[gpu]
+# Run `python pod.py gpus` to see exact ids RunPod is using right now.
+# Common 4090 ids: "NVIDIA GeForce RTX 4090".
+type_id = "NVIDIA GeForce RTX 4090"
+count = 1
+
+[cloud]
+# "SECURE" | "COMMUNITY" | "ALL". Network volumes only mount on SECURE pods.
+type = "SECURE"
+# Optional pin. Network volumes are tied to a single datacenter, so once you
+# create your volume put its datacenter id here so pod.py only schedules
+# pods that can actually mount it. Leave empty to let pod.py auto-detect
+# from the volume metadata.
+data_center_id = ""
+
+[volume]
+# Create the volume once in the RunPod UI (Storage -> Network Volumes),
+# pick a datacenter that has 4090s, then paste its id here.
+network_volume_id = "qrvzc4f4u5"
+# Mounted at /workspace inside the pod (RunPod default for network volumes).
+mount_path = "/workspace"
+
+[pod]
+# Ephemeral container disk (in GB). Holds the image + scratch. Anything you
+# care about should live in /workspace (the network volume).
+container_disk_in_gb = 50
+# Ports: 22 for SSH, 8888 for Jupyter. RunPod proxies HTTP ports.
+ports = "22/tcp,8888/http"
+# Min hardware. RunPod will round up to whatever the chosen GPU sku gives you.
+min_vcpu_count = 8
+min_memory_in_gb = 32
+name_prefix = "unsloth"
+
+[env]
+# Non-secret env vars baked into every pod. Secrets (WANDB_API_KEY, HF_TOKEN)
+# are read from your local .env at spin-up time and injected per-pod.
+HF_HUB_ENABLE_HF_TRANSFER = "1"
+HF_HOME = "/workspace/.cache/huggingface"
+WANDB_DIR = "/workspace/wandb"
+TRANSFORMERS_CACHE = "/workspace/.cache/huggingface/transformers"

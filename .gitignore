@@ -1,0 +1,18 @@
+# secrets — never commit
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# pod state (per-machine, not source)
+.last_pod
+
+# editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

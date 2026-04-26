@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""
+pod.py — one-file CLI for spinning RunPod Secure Cloud pods up and down with
+your Unsloth + wandb stack and a persistent network volume attached.
+
+Usage:
+  ./pod.py up                  # create a pod, attach volume, write ssh alias
+  ./pod.py status              # list your active pods
+  ./pod.py ssh   [POD_ID]      # exec into the most recent (or named) pod
+  ./pod.py code  [POD_ID]      # open VS Code Remote-SSH into /workspace
+  ./pod.py jupyter [POD_ID]    # open Jupyter Lab in your browser
+  ./pod.py logs  [POD_ID]      # print pod logs (best-effort via runpodctl)
+  ./pod.py stop  [POD_ID]      # halt pod (resumable, container disk billed)
+  ./pod.py down  [POD_ID]      # terminate pod (cheapest; volume data persists)
+  ./pod.py gpus                # list GPU type ids RunPod is currently exposing
+  ./pod.py volumes             # show your network volumes (datacenter ids)
+  ./pod.py info  [POD_ID]      # full pod metadata as JSON
+
+If POD_ID is omitted, pod.py uses the last pod id it created
+(stored in .last_pod next to this script).
+
+`up` also writes a `Host runpod` entry into ~/.ssh/config (between marked
+sentinels, idempotent), so `ssh runpod` and VS Code Remote-SSH "runpod"
+always point at the live pod even though IP/port change every session.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+# --- deps --------------------------------------------------------------------
+try:
+    import runpod
+except ImportError:
+    sys.exit("missing dep: pip install -r requirements.txt")
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    sys.exit("missing dep: pip install -r requirements.txt")
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib  # type: ignore[no-redef]
+
+# --- paths -------------------------------------------------------------------
+HERE = Path(__file__).resolve().parent
+ENV_FILE = HERE / ".env"
+CONFIG_FILE = HERE / "config.toml"
+LAST_POD_FILE = HERE / ".last_pod"
+
+load_dotenv(ENV_FILE)
+
+
+# --- helpers -----------------------------------------------------------------
+def die(msg: str, code: int = 1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        die(f"missing {CONFIG_FILE}; copy config.toml.example or see README")
+    with open(CONFIG_FILE, "rb") as f:
+        return tomllib.load(f)
+
+
+def init_runpod():
+    key = os.environ.get("RUNPOD_API_KEY")
+    if not key:
+        die("RUNPOD_API_KEY not set (put it in .env)")
+    runpod.api_key = key
+
+
+def find_public_key() -> Optional[str]:
+    """Prefer PUBLIC_KEY env var, then ~/.ssh/id_ed25519.pub, then id_rsa.pub."""
+    if os.environ.get("PUBLIC_KEY"):
+        return os.environ["PUBLIC_KEY"]
+    for fname in ("id_ed25519.pub", "id_rsa.pub"):
+        p = Path.home() / ".ssh" / fname
+        if p.exists():
+            return p.read_text().strip()
+    return None
+
+
+def remember(pod_id: str):
+    LAST_POD_FILE.write_text(pod_id)
+
+
+def recall() -> Optional[str]:
+    if LAST_POD_FILE.exists():
+        return LAST_POD_FILE.read_text().strip() or None
+    return None
+
+
+def resolve_pod_id(arg: Optional[str]) -> str:
+    if arg:
+        return arg
+    last = recall()
+    if not last:
+        die("no pod id given and no .last_pod recorded; run `pod.py up` first")
+    return last  # type: ignore[return-value]
+
+
+def auto_datacenter(volume_id: str) -> Optional[str]:
+    """Look up which datacenter the network volume lives in."""
+    # The Python SDK doesn't expose a dedicated `get_network_volumes` helper,
+    # so we hit the GraphQL endpoint directly via runpod.api.queries.
+    import requests
+
+    api_key = runpod.api_key
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    query = """query { myself { networkVolumes { id name dataCenterId size } } }"""
+    r = requests.post("https://api.runpod.io/graphql", json={"query": query}, headers=headers, timeout=30)
+    r.raise_for_status()
+    vols = (r.json().get("data") or {}).get("myself", {}).get("networkVolumes") or []
+    for v in vols:
+        if v["id"] == volume_id:
+            return v.get("dataCenterId")
+    return None
+
+
+# --- ssh config block --------------------------------------------------------
+SSH_CONFIG = Path.home() / ".ssh" / "config"
+SSH_BLOCK_BEGIN = "# >>> runpod-unsloth (managed by pod.py) >>>"
+SSH_BLOCK_END = "# <<< runpod-unsloth <<<"
+SSH_HOST_ALIAS = "runpod"
+
+
+def _read_ssh_config() -> str:
+    if not SSH_CONFIG.exists():
+        return ""
+    return SSH_CONFIG.read_text()
+
+
+def _strip_block(text: str) -> str:
+    """Remove our managed block (and any trailing blank line) if present."""
+    if SSH_BLOCK_BEGIN not in text:
+        return text
+    pre, _, rest = text.partition(SSH_BLOCK_BEGIN)
+    _, _, post = rest.partition(SSH_BLOCK_END)
+    out = pre.rstrip() + "\n" + post.lstrip()
+    return out.strip() + "\n"
+
+
+def write_ssh_alias(ip: str, port: int):
+    """Insert/replace a Host runpod block pointing at ip:port."""
+    SSH_CONFIG.parent.mkdir(mode=0o700, exist_ok=True)
+    block = (
+        f"{SSH_BLOCK_BEGIN}\n"
+        f"Host {SSH_HOST_ALIAS}\n"
+        f"  HostName {ip}\n"
+        f"  Port {port}\n"
+        f"  User root\n"
+        f"  StrictHostKeyChecking no\n"
+        f"  UserKnownHostsFile /dev/null\n"
+        f"  LogLevel ERROR\n"
+        f"  ServerAliveInterval 60\n"
+        f"  ServerAliveCountMax 3\n"
+        f"{SSH_BLOCK_END}\n"
+    )
+    cur = _strip_block(_read_ssh_config())
+    new = (cur.rstrip() + "\n\n" + block) if cur.strip() else block
+    SSH_CONFIG.write_text(new)
+    SSH_CONFIG.chmod(0o600)
+    print(f"[ssh-config] {SSH_CONFIG}: alias `{SSH_HOST_ALIAS}` -> {ip}:{port}")
+
+
+def remove_ssh_alias():
+    text = _read_ssh_config()
+    if SSH_BLOCK_BEGIN in text:
+        SSH_CONFIG.write_text(_strip_block(text))
+        print(f"[ssh-config] removed `{SSH_HOST_ALIAS}` alias")
+
+
+def list_volumes():
+    import requests
+
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {runpod.api_key}"}
+    query = """query { myself { networkVolumes { id name dataCenterId size } } }"""
+    r = requests.post("https://api.runpod.io/graphql", json={"query": query}, headers=headers, timeout=30)
+    r.raise_for_status()
+    return (r.json().get("data") or {}).get("myself", {}).get("networkVolumes") or []
+
+
+# --- commands ----------------------------------------------------------------
+def cmd_up(args, cfg):
+    if not cfg["volume"]["network_volume_id"]:
+        die("config.toml -> [volume].network_volume_id is empty.\n"
+            "  1. Create a network volume in the RunPod UI (Storage tab),\n"
+            "     pick a datacenter that has 4090s (e.g. EU-RO-1, US-CA-2),\n"
+            "  2. Paste its id into config.toml.")
+
+    dc = cfg["cloud"].get("data_center_id") or auto_datacenter(cfg["volume"]["network_volume_id"])
+    if not dc:
+        die("could not resolve datacenter for that network volume; set [cloud].data_center_id manually")
+
+    # Build env: bake-in non-secret vars from config + secrets from .env
+    env = dict(cfg.get("env") or {})
+    for var in ("WANDB_API_KEY", "HF_TOKEN", "WANDB_PROJECT", "WANDB_ENTITY", "JUPYTER_PASSWORD"):
+        if os.environ.get(var):
+            env[var] = os.environ[var]
+
+    pubkey = find_public_key()
+    if pubkey:
+        env["PUBLIC_KEY"] = pubkey
+    else:
+        print("[warn] no SSH public key found locally and PUBLIC_KEY not set in .env; "
+              "you'll be limited to RunPod's web SSH.", file=sys.stderr)
+
+    name = f"{cfg['pod']['name_prefix']}-{int(time.time())}"
+    image = args.image or cfg["image"]["name"]
+    gpu_type = args.gpu or cfg["gpu"]["type_id"]
+
+    print(f"[up] gpu={gpu_type}  cloud={cfg['cloud']['type']}  dc={dc}")
+    print(f"[up] image={image}")
+    print(f"[up] volume={cfg['volume']['network_volume_id']} -> {cfg['volume']['mount_path']}")
+
+    pod = runpod.create_pod(
+        name=name,
+        image_name=image,
+        gpu_type_id=gpu_type,
+        gpu_count=cfg["gpu"]["count"],
+        cloud_type=cfg["cloud"]["type"],
+        data_center_id=dc,
+        support_public_ip=True,
+        start_ssh=True,
+        container_disk_in_gb=cfg["pod"]["container_disk_in_gb"],
+        min_vcpu_count=cfg["pod"]["min_vcpu_count"],
+        min_memory_in_gb=cfg["pod"]["min_memory_in_gb"],
+        ports=cfg["pod"]["ports"],
+        volume_mount_path=cfg["volume"]["mount_path"],
+        env=env,
+        network_volume_id=cfg["volume"]["network_volume_id"],
+    )
+
+    pod_id = pod["id"]
+    remember(pod_id)
+    print(f"[up] pod {pod_id} created. waiting for it to become RUNNING...")
+
+    # Poll until the pod has a public ssh port mapped.
+    ssh_target = wait_for_ssh(pod_id, timeout=300)
+    if ssh_target:
+        ip, port = ssh_target
+        write_ssh_alias(ip, port)
+        print()
+        print("  ssh runpod                   # short form (uses ~/.ssh/config alias)")
+        print(f"  ssh -p {port} root@{ip}    # raw form")
+        print("  ./pod.py code                # open VS Code Remote-SSH on /workspace")
+        print(f"  ./pod.py jupyter             # https://{pod_id}-8888.proxy.runpod.net")
+    else:
+        print("[up] pod is up but SSH port not exposed yet; run `pod.py ssh` in a moment.")
+
+
+def wait_for_ssh(pod_id: str, timeout: int = 300):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        info = runpod.get_pod(pod_id)
+        runtime = (info or {}).get("runtime") or {}
+        ports = runtime.get("ports") or []
+        for p in ports:
+            if p.get("privatePort") == 22 and p.get("isIpPublic"):
+                return p["ip"], p["publicPort"]
+        time.sleep(5)
+    return None
+
+
+def cmd_status(args, cfg):
+    pods = runpod.get_pods()
+    if not pods:
+        print("no active pods.")
+        return
+    rows = []
+    for p in pods:
+        rows.append((
+            p.get("id", "?")[:12],
+            p.get("name", "")[:24],
+            p.get("desiredStatus", ""),
+            (p.get("machine") or {}).get("gpuDisplayName", "")[:24],
+            f"${p.get('costPerHr', 0):.2f}/hr",
+        ))
+    w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(r[i].ljust(w[i]) for i in range(len(r))))
+
+
+def cmd_ssh(args, cfg):
+    pod_id = resolve_pod_id(args.pod_id)
+    target = wait_for_ssh(pod_id, timeout=60)
+    if not target:
+        die(f"pod {pod_id} has no public SSH port yet (still booting?)")
+    ip, port = target
+    cmd = ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no", f"root@{ip}"]
+    print("$", " ".join(cmd))
+    os.execvp("ssh", cmd)
+
+
+def cmd_code(args, cfg):
+    """Open VS Code Remote-SSH into /workspace/runpod-unsloth on the pod."""
+    pod_id = resolve_pod_id(args.pod_id)
+    target = wait_for_ssh(pod_id, timeout=60)
+    if not target:
+        die(f"pod {pod_id} has no public SSH port yet (still booting?)")
+    ip, port = target
+    write_ssh_alias(ip, port)  # refresh in case it drifted
+    if not shutil.which("code"):
+        die("`code` CLI not on PATH. In VS Code: Cmd+Shift+P -> "
+            "'Shell Command: Install code command in PATH'.")
+    folder = args.folder or "/workspace/runpod-unsloth"
+    uri = f"vscode-remote://ssh-remote+{SSH_HOST_ALIAS}{folder}"
+    print(f"[code] opening {uri}")
+    subprocess.run(["code", "--folder-uri", uri], check=False)
+
+
+def cmd_jupyter(args, cfg):
+    """Open RunPod's HTTPS proxy URL for the pod's Jupyter server."""
+    import webbrowser
+    pod_id = resolve_pod_id(args.pod_id)
+    url = f"https://{pod_id}-8888.proxy.runpod.net/lab"
+    print(f"[jupyter] {url}")
+    if not args.print_only:
+        webbrowser.open(url)
+
+
+def cmd_logs(args, cfg):
+    pod_id = resolve_pod_id(args.pod_id)
+    runpodctl = shutil.which("runpodctl")
+    if runpodctl:
+        subprocess.run([runpodctl, "get", "pod", pod_id, "--logs"], check=False)
+    else:
+        info = runpod.get_pod(pod_id)
+        print(json.dumps(info, indent=2))
+        print("\n(install runpodctl for streaming logs: https://github.com/runpod/runpodctl)")
+
+
+def cmd_stop(args, cfg):
+    pod_id = resolve_pod_id(args.pod_id)
+    print(f"[stop] {pod_id}")
+    print(json.dumps(runpod.stop_pod(pod_id), indent=2))
+
+
+def cmd_down(args, cfg):
+    pod_id = resolve_pod_id(args.pod_id)
+    if not args.yes:
+        confirm = input(f"terminate pod {pod_id}? container disk will be wiped, "
+                        f"network volume is safe. [y/N] ").strip().lower()
+        if confirm != "y":
+            print("aborted.")
+            return
+    print(f"[down] {pod_id}")
+    print(json.dumps(runpod.terminate_pod(pod_id), indent=2))
+    if recall() == pod_id:
+        LAST_POD_FILE.unlink(missing_ok=True)
+    remove_ssh_alias()
+
+
+def cmd_gpus(args, cfg):
+    gpus = runpod.get_gpus()
+    for g in gpus:
+        if args.filter.lower() in g.get("displayName", "").lower():
+            print(f"  {g.get('id', ''):44}  {g.get('displayName', '')}  ({g.get('memoryInGb', '?')}GB)")
+
+
+def cmd_volumes(args, cfg):
+    vols = list_volumes()
+    if not vols:
+        print("no network volumes. create one in the RunPod UI -> Storage.")
+        return
+    for v in vols:
+        print(f"  {v['id']}  {v['name']:24}  dc={v.get('dataCenterId','?')}  size={v.get('size','?')}GB")
+
+
+def cmd_info(args, cfg):
+    pod_id = resolve_pod_id(args.pod_id)
+    print(json.dumps(runpod.get_pod(pod_id), indent=2))
+
+
+# --- arg parsing -------------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("up", help="spin up a pod")
+    sp.add_argument("--gpu", help="override config.toml [gpu].type_id")
+    sp.add_argument("--image", help="override config.toml [image].name")
+    sp.set_defaults(func=cmd_up)
+
+    sp = sub.add_parser("status", help="list active pods")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("ssh", help="ssh into a pod (default: last created)")
+    sp.add_argument("pod_id", nargs="?")
+    sp.set_defaults(func=cmd_ssh)
+
+    sp = sub.add_parser("code", help="open VS Code Remote-SSH on /workspace/runpod-unsloth")
+    sp.add_argument("pod_id", nargs="?")
+    sp.add_argument("--folder", help="path on the pod to open (default /workspace/runpod-unsloth)")
+    sp.set_defaults(func=cmd_code)
+
+    sp = sub.add_parser("jupyter", help="open RunPod-proxied Jupyter URL in browser")
+    sp.add_argument("pod_id", nargs="?")
+    sp.add_argument("--print-only", action="store_true", help="just print the URL")
+    sp.set_defaults(func=cmd_jupyter)
+
+    sp = sub.add_parser("logs", help="show pod logs")
+    sp.add_argument("pod_id", nargs="?")
+    sp.set_defaults(func=cmd_logs)
+
+    sp = sub.add_parser("stop", help="halt pod (resumable; container disk still billed)")
+    sp.add_argument("pod_id", nargs="?")
+    sp.set_defaults(func=cmd_stop)
+
+    sp = sub.add_parser("down", help="terminate pod (cheapest; network volume persists)")
+    sp.add_argument("pod_id", nargs="?")
+    sp.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+    sp.set_defaults(func=cmd_down)
+
+    sp = sub.add_parser("gpus", help="list available GPU types")
+    sp.add_argument("--filter", default="", help="substring filter, e.g. '4090'")
+    sp.set_defaults(func=cmd_gpus)
+
+    sp = sub.add_parser("volumes", help="list your network volumes")
+    sp.set_defaults(func=cmd_volumes)
+
+    sp = sub.add_parser("info", help="dump full pod metadata as JSON")
+    sp.add_argument("pod_id", nargs="?")
+    sp.set_defaults(func=cmd_info)
+
+    args = p.parse_args()
+    cfg = load_config()
+    init_runpod()
+    args.func(args, cfg)
+
+
+if __name__ == "__main__":
+    main()
