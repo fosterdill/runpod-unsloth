@@ -11,6 +11,9 @@ venv/
 # pod state (per-machine, not source)
 .last_pod
 
+# unsloth runtime-generated cache
+unsloth_compiled_cache/
+
 # editor / OS noise
 .DS_Store
 .idea/

@@ -2,10 +2,8 @@
 # Anything you don't want in source control (API keys) belongs in .env instead.
 
 [image]
-# Set to your pushed image, e.g. "fosterdill/runpod-unsloth:latest".
-# Use "unsloth/unsloth:latest" to skip the Dockerfile step (you lose the
-# baked-in env var defaults but everything else still works — pod.py will
-# pass the env vars at create-pod time).
+# The upstream Unsloth image. pod.py injects WANDB_API_KEY / HF_TOKEN and the
+# [env] vars below at create-pod time, so no custom build is needed.
 name = "unsloth/unsloth:latest"
 
 [gpu]

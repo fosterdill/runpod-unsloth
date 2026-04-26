@@ -6,8 +6,6 @@ and datasets stay alive between sessions.
 
 ```
 runpod-unsloth/
-├── Dockerfile           # FROM unsloth/unsloth + wandb + entrypoint (optional)
-├── entrypoint.sh        # only used if you build the custom image
 ├── pod.py               # local CLI: up / down / ssh / code / status / volumes / gpus
 ├── config.toml          # GPU, image, volume, ports — edit once
 ├── .env.example         # secrets (RunPod + wandb + HF tokens)
@@ -98,18 +96,7 @@ llama-server -m ~/models/unsloth.Q4_K_M.gguf -c 4096
    pod.py auto-detects the datacenter from the volume; you don't need to set
    `[cloud].data_center_id` unless you want to pin it.
 
-5. **Build and push the image** (skip this step if you set `[image].name` to
-   `unsloth/unsloth:latest` in config.toml — you lose the `WANDB_DIR` /
-   `HF_HOME` defaults but pod.py still injects WANDB_API_KEY).
-   ```bash
-   export DOCKER_USER=fosterdill           # your Docker Hub user
-   docker build --platform=linux/amd64 -t $DOCKER_USER/runpod-unsloth:latest .
-   docker push $DOCKER_USER/runpod-unsloth:latest
-   ```
-   Then update `[image].name` in `config.toml` to
-   `fosterdill/runpod-unsloth:latest`.
-
-6. **Add an SSH key.** pod.py picks up `~/.ssh/id_ed25519.pub` (or `id_rsa.pub`)
+5. **Add an SSH key.** pod.py picks up `~/.ssh/id_ed25519.pub` (or `id_rsa.pub`)
    automatically. If you'd rather use a different key, set `PUBLIC_KEY=...`
    in `.env`.
 
@@ -230,10 +217,10 @@ the network volume — no syncing needed.
 | `/workspace/wandb`                | yes — wandb local cache         |
 | anywhere else (`/root`, `/tmp`)   | gone on `down`                  |
 
-The Dockerfile pre-sets `HF_HOME`, `WANDB_DIR`, and `TRANSFORMERS_CACHE` to
-land under `/workspace/.cache`, so `huggingface_hub.snapshot_download(...)`
-and `wandb.init(...)` write into the volume by default. No code changes
-needed.
+`config.toml`'s `[env]` section sets `HF_HOME`, `WANDB_DIR`, and
+`TRANSFORMERS_CACHE` to land under `/workspace/.cache`, so
+`huggingface_hub.snapshot_download(...)` and `wandb.init(...)` write into
+the volume by default. No code changes needed.
 
 ## Sizing notes for 4B–9B on a 4090 (24 GB)
 
@@ -252,9 +239,9 @@ Always use `use_gradient_checkpointing="unsloth"` — it's free memory.
   the API key doesn't see it. Run `./pod.py volumes` to confirm.
 * **`gpu_type_id` rejected** — RunPod occasionally renames SKUs. Run
   `./pod.py gpus --filter 4090` and copy the exact `id` into `config.toml`.
-* **Pod is RUNNING but `ssh` hangs** — give it ~20 s after first boot;
-  sshd starts as part of the entrypoint. The RunPod web UI's *Connect → SSH*
-  also works as a fallback.
+* **Pod is RUNNING but `ssh` hangs** — give it ~20 s after first boot
+  for sshd to come up. The RunPod web UI's *Connect → SSH* also works
+  as a fallback.
 * **`wandb: ERROR Network error`** inside training — RunPod outbound is fine
   by default; this is almost always a stale `WANDB_API_KEY`. Re-run
   `wandb login` inside the pod, or just `./pod.py down` and `./pod.py up`
@@ -262,9 +249,9 @@ Always use `use_gradient_checkpointing="unsloth"` — it's free memory.
 
 ## Why this layout
 
-* **Custom Docker image, thin.** `FROM unsloth/unsloth` means we inherit
-  pinned PyTorch/CUDA/xformers/bitsandbytes. We add only wandb,
-  hf_transfer, tmux, and an entrypoint — no version drift.
+* **Upstream image, no custom build.** Using `unsloth/unsloth:latest`
+  directly means pinned PyTorch/CUDA/xformers/bitsandbytes with no
+  version drift and nothing to push to Docker Hub.
 * **Network volume for state, container for compute.** Container is
   disposable, volume isn't. `down` is reflex-cheap.
 * **`WANDB_API_KEY` injected per-pod, not baked.** It rides in via the
