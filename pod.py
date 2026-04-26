@@ -205,7 +205,7 @@ def write_ssh_alias(ip: str, port: int):
 
     Direct SSH supports PTY (so VS Code Remote-SSH works), unlike RunPod's
     proxy SSH which doesn't. To make this work the pod's authorized_keys
-    has to contain your public key — that's what bootstrap_authorized_keys()
+    has to contain your public key — that's what bootstrap_pod()
     does, using the proxy SSH path (which lands as the same `unsloth` user)
     as the channel.
     """
@@ -234,47 +234,76 @@ def write_ssh_alias(ip: str, port: int):
           f"{POD_SSH_USER}@{ip}:{port}  (identity: {identity})")
 
 
-def bootstrap_authorized_keys(pod_host_id: str, pubkey: str) -> tuple[bool, str]:
-    """Append `pubkey` to /workspace/.ssh/authorized_keys via proxy SSH.
+def bootstrap_pod(pod_host_id: str, pubkey: str,
+                  wandb_key: str = "", hf_token: str = "") -> tuple[bool, str]:
+    """Set up SSH key, wandb creds, and HF token on the pod via proxy SSH.
 
-    Why /workspace and not /root: the unsloth/unsloth image runs as user
-    `unsloth` (uid 1001) with home dir /workspace. Proxy SSH lands you as
-    that same user. So we can write into /workspace/.ssh/authorized_keys
-    (which we have permission for) and direct SSH as user `unsloth` on the
-    pod's exposed port 22 will accept the key.
+    Everything is written under /workspace (the unsloth user's home, which
+    IS the network volume). So once installed, all of these persist across
+    every future pod that mounts this volume — no re-running needed unless
+    you rotate keys.
 
-    BIG bonus: /workspace is the network volume, so once the key is there,
-    every future pod that mounts this volume sees it immediately — the
-    bootstrap is essentially a no-op forever after the first time.
+    Files touched on the pod:
+      * /workspace/.ssh/authorized_keys     — your local pubkey appended (idempotent)
+      * /workspace/.netrc                   — wandb credentials (if WANDB_API_KEY set)
+      * /workspace/.cache/huggingface/token — HF token (if HF_TOKEN set)
 
-    Implementation notes:
-      * `-tt` forces client-side PTY allocation. RunPod's proxy SSH refuses
-        sessions where the client won't accept a PTY ("Your SSH client
-        doesn't support PTY").
-      * We don't pass a remote command — the proxy ignores command args and
-        only gives you an interactive shell. So we drive that shell over
-        stdin (script + `exit`), and base64-embed the pubkey to avoid any
-        PTY input quoting weirdness.
+    Why proxy SSH:
+      * The unsloth image runs as uid 1001 (`unsloth`) with home /workspace.
+      * Proxy SSH lands you as that same user, so we can write under /workspace.
+      * Direct SSH on port 22 also accepts the unsloth user with the same key.
 
-    Returns (success, message). Idempotent — appends only if not present.
+    Why the script structure:
+      * `-tt` forces client-side PTY allocation; RunPod's proxy refuses
+        sessions whose clients don't accept a PTY.
+      * The proxy ignores ssh's `command` argument and only gives you an
+        interactive shell, so we drive that shell over stdin and base64-encode
+        secrets to avoid any quoting/PTY weirdness.
+
+    Returns (success, message).
     """
     import base64
     if not pubkey:
         return False, "no local public key found (~/.ssh/id_ed25519.pub or id_rsa.pub)"
     identity = os.path.expanduser(find_identity_file())
-    encoded = base64.b64encode(pubkey.encode()).decode()
+
+    enc_key = base64.b64encode(pubkey.encode()).decode()
     ak = POD_AUTHORIZED_KEYS
 
-    script = (
-        "set -e\n"
-        f"mkdir -p $(dirname {ak}) && chmod 700 $(dirname {ak})\n"
-        f"touch {ak}\n"
-        f"K=$(echo {encoded} | base64 -d)\n"
-        f"grep -qxF \"$K\" {ak} || echo \"$K\" >> {ak}\n"
-        f"chmod 600 {ak}\n"
-        "echo BOOTSTRAP_OK\n"
-        "exit\n"
-    )
+    # Build the script. Each section is independent and idempotent.
+    lines = [
+        "set -e",
+        # --- SSH key ---
+        f"mkdir -p $(dirname {ak}) && chmod 700 $(dirname {ak})",
+        f"touch {ak}",
+        f"K=$(echo {enc_key} | base64 -d)",
+        f"grep -qxF \"$K\" {ak} || echo \"$K\" >> {ak}",
+        f"chmod 600 {ak}",
+        "echo SSH_KEY_OK",
+    ]
+    if wandb_key:
+        enc_w = base64.b64encode(wandb_key.encode()).decode()
+        lines += [
+            # --- wandb (~/.netrc is what `wandb login` writes; libraries read it) ---
+            f"WK=$(echo {enc_w} | base64 -d)",
+            "umask 077",
+            "printf 'machine api.wandb.ai\\n  login user\\n  password %s\\n' \"$WK\" "
+            "  > /workspace/.netrc",
+            "chmod 600 /workspace/.netrc",
+            "echo WANDB_OK",
+        ]
+    if hf_token:
+        enc_h = base64.b64encode(hf_token.encode()).decode()
+        lines += [
+            # --- huggingface_hub reads ~/.cache/huggingface/token by default ---
+            f"HFT=$(echo {enc_h} | base64 -d)",
+            "mkdir -p /workspace/.cache/huggingface",
+            "printf '%s' \"$HFT\" > /workspace/.cache/huggingface/token",
+            "chmod 600 /workspace/.cache/huggingface/token",
+            "echo HF_OK",
+        ]
+    lines += ["echo BOOTSTRAP_OK", "exit"]
+    script = "\n".join(lines) + "\n"
     cmd = [
         "ssh",
         "-tt",                                  # force PTY (proxy requires it)
@@ -447,20 +476,27 @@ def connect_and_persist(pod_id: str, timeout: int = 600):
         return None
 
     pubkey = find_public_key()
+    wandb_key = os.environ.get("WANDB_API_KEY", "")
+    hf_token = os.environ.get("HF_TOKEN", "")
     if not pubkey:
         print("[bootstrap] no local public key (~/.ssh/id_ed25519.pub or id_rsa.pub); "
-              "skipping authorized_keys install. `ssh runpod` will fail until you "
-              "add a key. Generate one with: ssh-keygen -t ed25519", file=sys.stderr)
+              "skipping bootstrap. `ssh runpod` will fail until you add a key. "
+              "Generate one with: ssh-keygen -t ed25519", file=sys.stderr)
     else:
-        ok, msg = bootstrap_authorized_keys(target["pod_host_id"], pubkey)
+        ok, msg = bootstrap_pod(target["pod_host_id"], pubkey, wandb_key, hf_token)
         if ok:
-            print(f"[bootstrap] {msg}: ensured pubkey is in {POD_AUTHORIZED_KEYS} "
-                  f"(persists on the network volume)")
+            installed = ["ssh"]
+            if wandb_key:
+                installed.append("wandb")
+            if hf_token:
+                installed.append("hf")
+            print(f"[bootstrap] {msg}: installed {', '.join(installed)} creds "
+                  f"under /workspace (persists on the network volume)")
         else:
             print(f"[bootstrap] WARN: {msg}", file=sys.stderr)
-            print(f"[bootstrap] direct SSH will fail. As a workaround, ssh into the "
-                  f"pod via proxy ({target['pod_host_id']}@ssh.runpod.io) and append "
-                  f"your pubkey to {POD_AUTHORIZED_KEYS} manually.", file=sys.stderr)
+            print(f"[bootstrap] direct SSH will fail. As a workaround, ssh in via "
+                  f"proxy ({target['pod_host_id']}@ssh.runpod.io) and append your "
+                  f"pubkey to {POD_AUTHORIZED_KEYS} manually.", file=sys.stderr)
 
     write_ssh_alias(target["ip"], target["port"])
     return target
