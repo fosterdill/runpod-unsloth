@@ -96,6 +96,14 @@ def main():
     )
     FastLanguageModel.for_inference(model)
 
+    if args.format == "chat" and not getattr(tokenizer, "chat_template", None):
+        sys.exit(
+            f"\nerror: {args.adapter} has no tokenizer.chat_template, so --format chat won't work.\n"
+            "this is normal for base (non-Instruct) models. either:\n"
+            "  - load the -Instruct variant of this model, or\n"
+            "  - rerun with --format alpaca (single-turn).\n"
+        )
+
     print(f"\n  chat mode: {args.format}")
     print(f"  format=alpaca = single-turn  |  format=chat = multi-turn")
     print(f"  /help for commands, /exit to quit\n")
