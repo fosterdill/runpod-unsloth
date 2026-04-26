@@ -241,21 +241,24 @@ def write_ssh_alias(ip: str, port: int):
 
 def bootstrap_pod(pod_host_id: str, pubkey: str,
                   wandb_key: str = "", hf_token: str = "") -> tuple[bool, str]:
-    """Set up SSH key, wandb creds, and HF token on the pod via proxy SSH.
+    """Set up SSH key, wandb creds, HF token, and bashrc shortcut on the pod.
 
-    Everything is written under /workspace (the unsloth user's home, which
-    IS the network volume). So once installed, all of these persist across
-    every future pod that mounts this volume — no re-running needed unless
-    you rotate keys.
+    Persistent bits go on /workspace (the network volume) so they survive
+    pod terminations. The bashrc cd shortcut goes on /home/unsloth (which
+    is on the container disk and wiped per pod), so we re-apply it on
+    every `up`.
 
     Files touched on the pod:
       * /workspace/.ssh/authorized_keys     — your local pubkey appended (idempotent)
       * /workspace/.netrc                   — wandb credentials (if WANDB_API_KEY set)
       * /workspace/.cache/huggingface/token — HF token (if HF_TOKEN set)
+      * /home/unsloth/.bashrc               — `cd /workspace/runpod-unsloth` line
+                                              (re-applied each up since the
+                                              container disk is wiped on down)
 
     Why proxy SSH:
-      * The unsloth image runs as uid 1001 (`unsloth`) with home /workspace.
-      * Proxy SSH lands you as that same user, so we can write under /workspace.
+      * The unsloth image runs as uid 1001 (`unsloth`).
+      * Proxy SSH lands you as that same user, so writes are owned correctly.
       * Direct SSH on port 22 also accepts the unsloth user with the same key.
 
     Why the script structure:
@@ -307,6 +310,14 @@ def bootstrap_pod(pod_host_id: str, pubkey: str,
             "chmod 600 /workspace/.cache/huggingface/token",
             "echo HF_OK",
         ]
+    lines += [
+        # --- bashrc cd shortcut (idempotent; re-applied each `up`) ---
+        "BRC=/home/unsloth/.bashrc",
+        "CD='cd /workspace/runpod-unsloth 2>/dev/null'",
+        "touch \"$BRC\"",
+        "grep -qxF \"$CD\" \"$BRC\" || echo \"$CD\" >> \"$BRC\"",
+        "echo BASHRC_OK",
+    ]
     lines += ["echo BOOTSTRAP_OK", "exit"]
     script = "\n".join(lines) + "\n"
     cmd = [
