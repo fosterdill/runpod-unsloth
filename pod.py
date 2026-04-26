@@ -195,10 +195,12 @@ def find_identity_file() -> str:
 
 
 # SSH login user inside the pod. The unsloth/unsloth image runs as a
-# non-root user `unsloth` (uid 1001) whose home directory is /workspace —
-# the network volume. This is exactly what we want: dropping our public
-# key into /workspace/.ssh/authorized_keys means the key persists across
-# every pod that mounts this volume.
+# non-root user `unsloth` (uid 1001). Their $HOME is /home/unsloth (on the
+# container disk, wiped each pod), so we stash credentials under /workspace
+# — the network volume — to survive pod terminations. The upstream image's
+# sshd has AuthorizedKeysFile pointing at /workspace/.ssh/authorized_keys,
+# so installing the pubkey there once means every future pod that mounts
+# this volume already trusts our key.
 POD_SSH_USER = "unsloth"
 POD_AUTHORIZED_KEYS = "/workspace/.ssh/authorized_keys"
 

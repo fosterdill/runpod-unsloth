@@ -68,6 +68,18 @@ eval:
   steps: 60                               # evaluate every N training steps; defaults to save_steps
   batch_size: 2                           # per_device_eval_batch_size; defaults to batch_size
 
+# Mask user/system tokens out of the loss — only the assistant response
+# contributes. Requires data.format=chat. Markers are auto-picked for
+# Llama-3 / Qwen / Gemma; override if you're on something else.
+train_on_responses_only: false
+# instruction_part: "<|start_header_id|>user<|end_header_id|>\n\n"
+# response_part:    "<|start_header_id|>assistant<|end_header_id|>\n\n"
+
+# Reload the lowest-eval_loss checkpoint at end of training (the final adapter
+# saved out is the best one, not the last one). Requires an eval set, and
+# save_steps must be a multiple of eval.steps.
+load_best_model_at_end: false
+
 # Output
 output_dir: /workspace/runs               # full path = output_dir/name
 wandb_project: runpod-unsloth

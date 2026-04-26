@@ -19,3 +19,9 @@ unsloth_compiled_cache/
 .idea/
 .vscode/
 *.swp
+
+# wandb run artifacts (per-machine, regenerated)
+wandb/
+
+# Claude Code per-project state
+.claude/
